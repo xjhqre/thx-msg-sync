@@ -1,8 +1,12 @@
 import os
 import time
 import json
+import subprocess
 import logging
 import requests
+from pathlib import Path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from typing import List, Dict, Any
 
 # ---------- 配置 ----------
@@ -14,6 +18,46 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.jso
 # 日志设置
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# 共享连接：复用连接池，并对 5xx/429 自动重试（最多 3 次，指数退避）
+_session = requests.Session()
+_adapter = HTTPAdapter(max_retries=Retry(
+    total=3, backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504]
+))
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+)
+
+_HEXIN_JS = Path(__file__).resolve().parent / "hexin-v.js"
+
+
+def generate_hexin_v_via_js(*, server_time: int, user_agent: str) -> str:
+    """调用 hexin-v.js 生成 hexin-v / cookie v。"""
+    opts = json.dumps({"serverTime": server_time, "userAgent": user_agent})
+    script = (
+        "const { buildFingerprint, encodeHexinV } = require(process.argv[1]);"
+        "const fields = buildFingerprint(JSON.parse(process.argv[2]));"
+        "process.stdout.write(encodeHexinV(fields));"
+    )
+    proc = subprocess.run(
+        ["node", "-e", script, str(_HEXIN_JS), opts],
+        capture_output=True,
+        text=True,
+        cwd=_HEXIN_JS.parent,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"hexin-v.js failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    token = proc.stdout.strip()
+    if not token:
+        raise RuntimeError("hexin-v.js returned empty token")
+    return token
 
 # ---------- 请求函数 ----------
 def fetch_user_contents(user_code: str) -> List[Dict[str, Any]]:
@@ -42,19 +86,18 @@ def fetch_user_contents(user_code: str) -> List[Dict[str, Any]]:
     payload = {"user_code": user_code}
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        resp = _session.post(url, headers=headers, json=payload, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if data.get("status_code") != 0:
-            logger.error(f"接口返回异常: {data.get('status_code')} - {data.get('status_msg')}")
-            return []
+            raise RuntimeError(f"接口返回异常: {data.get('status_code')} - {data.get('status_msg')}")
         # 实际返回结构为嵌套在 data 下的 contents 列表
         contents = data.get("data", {}).get("contents", [])
         logger.info(f"请求成功，获取到 {len(contents)} 条动态")
         return contents
     except Exception as e:
         logger.error(f"请求失败: {e}")
-        return []
+        raise  # 让上层做退避，避免快速连打
 
 # ---------- 微信推送 ----------
 def send_to_wechat(content: str) -> None:
@@ -73,7 +116,7 @@ def send_to_wechat(content: str) -> None:
         "text": {"content": content}
     }
     try:
-        resp = requests.post(WECHAT_WEBHOOK, json=data, timeout=5)
+        resp = _session.post(WECHAT_WEBHOOK, json=data, timeout=5)
         if resp.status_code == 200:
             logger.info("微信推送成功")
         else:
@@ -104,9 +147,14 @@ def main():
     last_id = load_last_id()   # 从持久化文件恢复上次进度
     logger.info(f"开始监控用户 {USER_CODE}，间隔 {INTERVAL} 秒，上次动态 ID: {last_id or '无'}")
 
+    consecutive_failures = 0
+    max_backoff = 300  # 退避上限（秒），避免持续故障时无限延长
+
     while True:
         try:
-            contents = fetch_user_contents(USER_CODE)
+            contents = fetch_user_contents(USER_CODE)  # 出错会抛异常
+            consecutive_failures = 0  # 请求成功，重置失败计数
+
             if not contents:
                 time.sleep(INTERVAL)
                 continue
@@ -138,8 +186,19 @@ def main():
 
         except Exception as e:
             logger.error(f"主循环异常: {e}")
+            # 指数退避：n 次连续失败后等待 INTERVAL * 2^(n-1)，封顶 max_backoff
+            consecutive_failures += 1
+            backoff = min(INTERVAL * (2 ** (consecutive_failures - 1)), max_backoff)
+            logger.warning(f"连续失败 {consecutive_failures} 次，{backoff}s 后重试")
+            time.sleep(backoff)
+            continue
 
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    # main()
+    hexin = generate_hexin_v_via_js(
+        server_time=int(time.time()),
+        user_agent=DEFAULT_UA,
+    )
+    print(hexin)
