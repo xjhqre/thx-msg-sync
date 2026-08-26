@@ -60,7 +60,7 @@ def generate_hexin_v_via_js(*, server_time: int, user_agent: str) -> str:
     return token
 
 # ---------- 请求函数 ----------
-def fetch_user_contents(user_code: str) -> List[Dict[str, Any]]:
+def fetch_user_contents(user_code: str, hexin: str) -> List[Dict[str, Any]]:
     """
     调用同花顺接口，获取用户动态列表
     返回 contents 列表，若失败返回空列表
@@ -78,7 +78,7 @@ def fetch_user_contents(user_code: str) -> List[Dict[str, Any]]:
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-        "hexin-v": "BCOqHPlqnpHaapyW9YvDmHQBzAWtAHgAlwC6ANEADADbDkoANfwYA6AAZwOe",  # 可能需要定期更新
+        "hexin-v": "BCMOHI1qAp98auCuwYuHmDgB6AVZAHQAowCWAD0AyACnDi4AYfykAxQAuwM6",  # 可能需要定期更新
         "sec-ch-ua": '"Chromium";v="134", "Not:A-Brand";v="24", "Google Chrome";v="134"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
@@ -152,7 +152,11 @@ def main():
 
     while True:
         try:
-            contents = fetch_user_contents(USER_CODE)  # 出错会抛异常
+            hexin = generate_hexin_v_via_js(
+                server_time=int(time.time()),
+                user_agent=DEFAULT_UA,
+            )
+            contents = fetch_user_contents(USER_CODE, hexin)  # 出错会抛异常
             consecutive_failures = 0  # 请求成功，重置失败计数
 
             if not contents:
@@ -196,9 +200,4 @@ def main():
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
-    # main()
-    hexin = generate_hexin_v_via_js(
-        server_time=int(time.time()),
-        user_agent=DEFAULT_UA,
-    )
-    print(hexin)
+    main()
